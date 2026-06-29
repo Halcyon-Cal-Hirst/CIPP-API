@@ -81,6 +81,14 @@ function Get-CippMcpToolList {
                     $InputSchema['required'] = @($RequiredList | Select-Object -Unique)
                 }
 
+                # Normalise OpenAPI 3.0 schema constructs into JSON Schema draft 2020-12 so the
+                # Anthropic tools API accepts the schema. Without this, OpenAPI-only keywords
+                # (boolean exclusiveMinimum/Maximum, nullable, arrays without items, etc.) are
+                # passed through verbatim and rejected with
+                #   "input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12",
+                # which fails the entire tools/list for stricter clients (e.g. Claude).
+                $InputSchema = ConvertTo-CippMcpSchemaNode -Node $InputSchema
+
                 $Tag = @($Op['tags'])[0]
                 $Category = if ($Tag) { ([string]$Tag -split '\s*>\s*')[0].Trim() } else { 'Uncategorized' }
 
@@ -129,6 +137,54 @@ function Get-CippMcpToolList {
                 annotations = $_.annotations
             }
         })
+}
+
+function ConvertTo-CippMcpSchemaNode {
+    # Recursively normalises a resolved OpenAPI 3.0 schema node into a JSON Schema
+    # draft 2020-12-safe node that the Anthropic tools API will accept. Internal helper.
+    param($Node, [int]$Depth = 0)
+
+    if ($null -eq $Node) { return $null }
+    if ($Depth -gt 20) { return @{ type = 'object' } }
+
+    # Arrays: sanitise each element.
+    if ($Node -isnot [System.Collections.IDictionary] -and
+        $Node -is [System.Collections.IEnumerable] -and $Node -isnot [string]) {
+        return @($Node | ForEach-Object { ConvertTo-CippMcpSchemaNode -Node $_ -Depth ($Depth + 1) })
+    }
+
+    # Scalars pass through.
+    if ($Node -isnot [System.Collections.IDictionary]) { return $Node }
+
+    # OpenAPI-only / annotation keywords that are invalid or unnecessary in draft 2020-12.
+    $Drop = @('nullable', 'example', 'examples', 'discriminator', 'xml', 'externalDocs',
+        'deprecated', 'readOnly', 'writeOnly', '$schema', '$id')
+
+    $WasNullable = [bool]$Node['nullable']
+    $Out = [ordered]@{}
+
+    foreach ($Entry in $Node.GetEnumerator()) {
+        $Key = [string]$Entry.Key
+        if ($Key -in $Drop) { continue }
+
+        # exclusiveMinimum/exclusiveMaximum are booleans in OpenAPI 3.0 / draft-04 but MUST be
+        # numbers in draft 2020-12. A boolean value fails meta-schema validation, so drop it.
+        if ($Key -in @('exclusiveMinimum', 'exclusiveMaximum') -and $Entry.Value -is [bool]) { continue }
+
+        $Out[$Key] = ConvertTo-CippMcpSchemaNode -Node $Entry.Value -Depth ($Depth + 1)
+    }
+
+    # Fold OpenAPI's `nullable: true` into a 2020-12 type union.
+    if ($WasNullable -and $Out['type'] -is [string] -and $Out['type'] -ne 'null') {
+        $Out['type'] = @($Out['type'], 'null')
+    }
+
+    # A 2020-12 'array' schema must define items.
+    if ($Out['type'] -eq 'array' -and -not $Out.Contains('items')) {
+        $Out['items'] = @{}
+    }
+
+    return $Out
 }
 
 function Resolve-CippMcpNode {
